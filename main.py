@@ -38,6 +38,40 @@ movie_matrix = sparse.load_npz(f"{MODEL_DIR}movie_matrix.npz")
 tv_df = pd.read_csv(f"{MODEL_DIR}tv_data.csv")
 tv_matrix = sparse.load_npz(f"{MODEL_DIR}tv_matrix.npz")
 
+
+def shelf_items(data, media_type):
+    # Keep the first row for each name, matching /recommend's title lookup.
+    seen = set()
+    items = []
+    for row in data.itertuples(index=False):
+        title = str(row.title).strip()
+        key = title.casefold()
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "id": int(row.id),
+            "title": title,
+            "media_type": media_type,
+            "genres": str(row.genres) if pd.notna(row.genres) else "",
+            "poster_path": str(row.poster_path) if pd.notna(row.poster_path) else None,
+        })
+    return items
+
+
+SHELF_MOVIES = shelf_items(movies_df, "movie")
+SHELF_TV = shelf_items(tv_df, "tv")
+SHELF_ALL = []
+seen_shelf_titles = set()
+for index in range(max(len(SHELF_MOVIES), len(SHELF_TV))):
+    for catalogue in (SHELF_MOVIES, SHELF_TV):
+        if index < len(catalogue):
+            item = catalogue[index]
+            key = item["title"].casefold()
+            if key not in seen_shelf_titles:
+                seen_shelf_titles.add(key)
+                SHELF_ALL.append(item)
+
 print("Loading Complete! Server is ready.")
 
 # 2. Frontend එකෙන් එන Request එකේ තිබිය යුතු දත්ත ආකෘතිය
@@ -50,6 +84,13 @@ class SearchQuery(BaseModel):
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Movie/TV Recommender API!"}
+
+
+@app.get("/shelf")
+async def get_shelf(media_type: Literal["all", "movie", "tv"] = "all", offset: int = Query(default=0, ge=0)):
+    catalogue = {"all": SHELF_ALL, "movie": SHELF_MOVIES, "tv": SHELF_TV}[media_type]
+    items = catalogue[offset:offset + 5]
+    return {"items": items, "has_more": offset + len(items) < len(catalogue)}
 
 
 OMDB_URL = "https://www.omdbapi.com/"
