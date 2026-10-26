@@ -1,4 +1,13 @@
-from fastapi import FastAPI, HTTPException
+import os
+import re
+import asyncio
+import json
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
@@ -41,6 +50,60 @@ class SearchQuery(BaseModel):
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Movie/TV Recommender API!"}
+
+
+OMDB_URL = "https://www.omdbapi.com/"
+
+
+async def omdb_request(params: dict):
+    api_key = os.getenv("OMDB_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Title search is unavailable: OMDB_API_KEY is not configured.")
+    def fetch():
+        url = f"{OMDB_URL}?{urlencode({**params, 'apikey': api_key})}"
+        with urlopen(url, timeout=8) as response:
+            return json.load(response)
+
+    try:
+        data = await asyncio.to_thread(fetch)
+    except (URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail="OMDb is unavailable. Please try again shortly.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="OMDb returned an invalid response.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="OMDb returned an invalid response.")
+    return data
+
+
+@app.get("/omdb/search")
+async def search_omdb(
+    title: str = Query(min_length=1, max_length=100),
+    media_type: Literal["movie", "series"] | None = None,
+):
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Enter a title to search.")
+    params = {"s": title}
+    if media_type:
+        params["type"] = media_type
+    data = await omdb_request(params)
+    if data.get("Response") == "False":
+        if data.get("Error") == "Movie not found!":
+            return {"results": [], "total_results": 0}
+        raise HTTPException(status_code=502, detail=data.get("Error", "OMDb search failed."))
+    return {"results": data.get("Search", []), "total_results": int(data.get("totalResults", 0))}
+
+
+@app.get("/omdb/title/{imdb_id}")
+async def omdb_detail(imdb_id: str = Path(min_length=9, max_length=12)):
+    if not re.fullmatch(r"tt\d{7,10}", imdb_id):
+        raise HTTPException(status_code=422, detail="Invalid IMDb ID.")
+    data = await omdb_request({"i": imdb_id, "plot": "full"})
+    if data.get("Response") == "False":
+        if data.get("Error") == "Incorrect IMDb ID.":
+            raise HTTPException(status_code=404, detail="Title not found.")
+        raise HTTPException(status_code=502, detail=data.get("Error", "OMDb detail request failed."))
+    return data
 
 # 3. Principal API Endpoint
 @app.post("/recommend")
