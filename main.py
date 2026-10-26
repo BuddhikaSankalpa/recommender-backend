@@ -79,6 +79,7 @@ class SearchQuery(BaseModel):
     title: str
     media_type: str # "movie" හෝ "tv" විය යුතුය
     top_k: int = 5
+    tmdb_id: int | None = None
 
 # 3. ප්‍රධාන API Endpoint එක (Recommendation Logic)
 @app.get("/")
@@ -161,7 +162,10 @@ async def get_recommendations(query: SearchQuery):
         raise HTTPException(status_code=400, detail="media_type must be 'movie' or 'tv'")
 
     # නම (Title) දත්ත ගොනුවේ තිබේදැයි සෙවීම
-    matches = data[data["title"].astype(str).str.casefold() == title].index
+    if query.tmdb_id is not None:
+        matches = data[(data["id"] == query.tmdb_id) & (data["title"].astype(str).str.casefold() == title)].index
+    else:
+        matches = data[data["title"].astype(str).str.casefold() == title].index
 
     if len(matches) == 0:
         raise HTTPException(status_code=404, detail=f"'{query.title}' not found in {query.media_type}s.")
