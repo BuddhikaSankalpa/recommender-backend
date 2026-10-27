@@ -3,11 +3,13 @@ import re
 import asyncio
 import json
 import secrets
+from pathlib import Path as FilePath
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from typing import Literal
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,13 +18,18 @@ import joblib
 from scipy import sparse
 from sklearn.metrics.pairwise import cosine_similarity
 
+
+# Load recommender-backend/.env before reading OMDB_API_KEY
+load_dotenv(FilePath(__file__).resolve().parent / ".env")
+
+
 # FastAPI app එක ආරම්භ කිරීම
 app = FastAPI()
 
 # Frontend එකට (React) මෙම API එකට කතා කිරීමට අවසර දීම (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # සැබෑ වෙබ් අඩවියකදී මෙය ඔබගේ Frontend URL එක විය යුතුය
+    allow_origins=["*"],  # සැබෑ වෙබ් අඩවියකදී මෙය ඔබගේ Frontend URL එක විය යුතුය
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,7 +37,7 @@ app.add_middleware(
 
 print("Loading Models and Data... Please wait.")
 
-# 1. Models සහ Data Load කරගැනීම (ඔබේ ෆෝල්ඩරයේ නමට අදාළව Paths සකසා ඇත)
+# 1. Models සහ Data Load කරගැනීම
 MODEL_DIR = "models/"
 
 movies_df = pd.read_csv(f"{MODEL_DIR}movies_data.csv")
@@ -44,11 +51,14 @@ def shelf_items(data, media_type):
     # Keep the first row for each name, matching /recommend's title lookup.
     seen = set()
     items = []
+
     for row in data.itertuples(index=False):
         title = str(row.title).strip()
         key = title.casefold()
+
         if not title or key in seen:
             continue
+
         seen.add(key)
         items.append({
             "id": int(row.id),
@@ -57,6 +67,7 @@ def shelf_items(data, media_type):
             "genres": str(row.genres) if pd.notna(row.genres) else "",
             "poster_path": str(row.poster_path) if pd.notna(row.poster_path) else None,
         })
+
     return items
 
 
@@ -64,27 +75,43 @@ SHELF_MOVIES = shelf_items(movies_df, "movie")
 SHELF_TV = shelf_items(tv_df, "tv")
 SHELF_ALL = []
 seen_shelf_titles = set()
+
 for index in range(max(len(SHELF_MOVIES), len(SHELF_TV))):
     for catalogue in (SHELF_MOVIES, SHELF_TV):
         if index < len(catalogue):
             item = catalogue[index]
             key = item["title"].casefold()
+
             if key not in seen_shelf_titles:
                 seen_shelf_titles.add(key)
                 SHELF_ALL.append(item)
 
 
 def surprise_items(data, media_type):
-    complete = data.dropna(subset=["id", "title", "genres", "overview", "poster_path"])
+    complete = data.dropna(
+        subset=["id", "title", "genres", "overview", "poster_path"]
+    )
+
     for field in ("title", "genres", "overview", "poster_path"):
-        complete = complete[complete[field].astype(str).str.strip().ne("")]
-    return [{"id": int(row.id), "title": str(row.title), "media_type": media_type} for row in complete.itertuples(index=False)]
+        complete = complete[
+            complete[field].astype(str).str.strip().ne("")
+        ]
+
+    return [
+        {
+            "id": int(row.id),
+            "title": str(row.title),
+            "media_type": media_type,
+        }
+        for row in complete.itertuples(index=False)
+    ]
 
 
 SURPRISE_CATALOGUE = {
     "movie": surprise_items(movies_df, "movie"),
     "tv": surprise_items(tv_df, "tv"),
 }
+
 SURPRISE_INDEX = {
     (media_type, item["id"]): index
     for media_type, items in SURPRISE_CATALOGUE.items()
@@ -93,41 +120,81 @@ SURPRISE_INDEX = {
 
 print("Loading Complete! Server is ready.")
 
+
 # 2. Frontend එකෙන් එන Request එකේ තිබිය යුතු දත්ත ආකෘතිය
 class SearchQuery(BaseModel):
     title: str
-    media_type: str # "movie" හෝ "tv" විය යුතුය
+    media_type: str  # "movie" හෝ "tv" විය යුතුය
     top_k: int = 5
     tmdb_id: int | None = None
 
-# 3. ප්‍රධාන API Endpoint එක (Recommendation Logic)
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Movie/TV Recommender API!"}
 
 
 @app.get("/shelf")
-async def get_shelf(media_type: Literal["all", "movie", "tv"] = "all", offset: int = Query(default=0, ge=0)):
-    catalogue = {"all": SHELF_ALL, "movie": SHELF_MOVIES, "tv": SHELF_TV}[media_type]
+async def get_shelf(
+    media_type: Literal["all", "movie", "tv"] = "all",
+    offset: int = Query(default=0, ge=0),
+):
+    catalogue = {
+        "all": SHELF_ALL,
+        "movie": SHELF_MOVIES,
+        "tv": SHELF_TV,
+    }[media_type]
+
     items = catalogue[offset:offset + 5]
-    return {"items": items, "has_more": offset + len(items) < len(catalogue)}
+
+    return {
+        "items": items,
+        "has_more": offset + len(items) < len(catalogue),
+    }
 
 
 @app.get("/surprise")
-async def get_surprise(previous_id: int | None = None, previous_media_type: Literal["movie", "tv"] | None = None):
-    previous_index = SURPRISE_INDEX.get((previous_media_type, previous_id))
+async def get_surprise(
+    previous_id: int | None = None,
+    previous_media_type: Literal["movie", "tv"] | None = None,
+):
+    previous_index = SURPRISE_INDEX.get(
+        (previous_media_type, previous_id)
+    )
+
     available_types = [
-        media_type for media_type, items in SURPRISE_CATALOGUE.items()
-        if len(items) > (1 if previous_media_type == media_type and previous_index is not None else 0)
+        media_type
+        for media_type, items in SURPRISE_CATALOGUE.items()
+        if len(items) > (
+            1
+            if previous_media_type == media_type
+            and previous_index is not None
+            else 0
+        )
     ]
+
     if not available_types:
-        raise HTTPException(status_code=404, detail="No titles are available for Surprise Me.")
+        raise HTTPException(
+            status_code=404,
+            detail="No titles are available for Surprise Me.",
+        )
+
     media_type = secrets.choice(available_types)
     items = SURPRISE_CATALOGUE[media_type]
-    skip_index = previous_index if media_type == previous_media_type else None
-    index = secrets.randbelow(len(items) - (skip_index is not None))
+
+    skip_index = (
+        previous_index
+        if media_type == previous_media_type
+        else None
+    )
+
+    index = secrets.randbelow(
+        len(items) - (skip_index is not None)
+    )
+
     if skip_index is not None and index >= skip_index:
         index += 1
+
     return items[index]
 
 
@@ -136,8 +203,13 @@ OMDB_URL = "https://www.omdbapi.com/"
 
 async def omdb_request(params: dict):
     api_key = os.getenv("OMDB_API_KEY")
+
     if not api_key:
-        raise HTTPException(status_code=503, detail="Title search is unavailable: OMDB_API_KEY is not configured.")
+        raise HTTPException(
+            status_code=503,
+            detail="Title search is unavailable: OMDB_API_KEY is not configured.",
+        )
+
     def fetch():
         url = f"{OMDB_URL}?{urlencode({**params, 'apikey': api_key})}"
         with urlopen(url, timeout=8) as response:
@@ -146,11 +218,22 @@ async def omdb_request(params: dict):
     try:
         data = await asyncio.to_thread(fetch)
     except (URLError, TimeoutError) as exc:
-        raise HTTPException(status_code=502, detail="OMDb is unavailable. Please try again shortly.") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="OMDb is unavailable. Please try again shortly.",
+        ) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="OMDb returned an invalid response.") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="OMDb returned an invalid response.",
+        ) from exc
+
     if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="OMDb returned an invalid response.")
+        raise HTTPException(
+            status_code=502,
+            detail="OMDb returned an invalid response.",
+        )
+
     return data
 
 
@@ -160,35 +243,73 @@ async def search_omdb(
     media_type: Literal["movie", "series"] | None = None,
 ):
     title = title.strip()
+
     if not title:
-        raise HTTPException(status_code=422, detail="Enter a title to search.")
+        raise HTTPException(
+            status_code=422,
+            detail="Enter a title to search.",
+        )
+
     params = {"s": title}
+
     if media_type:
         params["type"] = media_type
+
     data = await omdb_request(params)
+
     if data.get("Response") == "False":
         if data.get("Error") == "Movie not found!":
             return {"results": [], "total_results": 0}
-        raise HTTPException(status_code=502, detail=data.get("Error", "OMDb search failed."))
-    return {"results": data.get("Search", []), "total_results": int(data.get("totalResults", 0))}
+
+        raise HTTPException(
+            status_code=502,
+            detail=data.get("Error", "OMDb search failed."),
+        )
+
+    return {
+        "results": data.get("Search", []),
+        "total_results": int(data.get("totalResults", 0)),
+    }
 
 
 @app.get("/omdb/title/{imdb_id}")
-async def omdb_detail(imdb_id: str = Path(min_length=9, max_length=12)):
+async def omdb_detail(
+    imdb_id: str = Path(min_length=9, max_length=12),
+):
     if not re.fullmatch(r"tt\d{7,10}", imdb_id):
-        raise HTTPException(status_code=422, detail="Invalid IMDb ID.")
-    data = await omdb_request({"i": imdb_id, "plot": "full"})
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid IMDb ID.",
+        )
+
+    data = await omdb_request({
+        "i": imdb_id,
+        "plot": "full",
+    })
+
     if data.get("Response") == "False":
         if data.get("Error") == "Incorrect IMDb ID.":
-            raise HTTPException(status_code=404, detail="Title not found.")
-        raise HTTPException(status_code=502, detail=data.get("Error", "OMDb detail request failed."))
+            raise HTTPException(
+                status_code=404,
+                detail="Title not found.",
+            )
+
+        raise HTTPException(
+            status_code=502,
+            detail=data.get(
+                "Error",
+                "OMDb detail request failed.",
+            ),
+        )
+
     return data
 
-# 3. Principal API Endpoint
+
+# Principal API Endpoint
 @app.post("/recommend")
 async def get_recommendations(query: SearchQuery):
     title = query.title.strip().casefold()
-    
+
     if query.media_type == "movie":
         data = movies_df
         matrix = movie_matrix
@@ -196,36 +317,58 @@ async def get_recommendations(query: SearchQuery):
         data = tv_df
         matrix = tv_matrix
     else:
-        raise HTTPException(status_code=400, detail="media_type must be 'movie' or 'tv'")
+        raise HTTPException(
+            status_code=400,
+            detail="media_type must be 'movie' or 'tv'",
+        )
 
     # නම (Title) දත්ත ගොනුවේ තිබේදැයි සෙවීම
     if query.tmdb_id is not None:
-        matches = data[(data["id"] == query.tmdb_id) & (data["title"].astype(str).str.casefold() == title)].index
+        matches = data[
+            (data["id"] == query.tmdb_id)
+            & (data["title"].astype(str).str.casefold() == title)
+        ].index
     else:
-        matches = data[data["title"].astype(str).str.casefold() == title].index
+        matches = data[
+            data["title"].astype(str).str.casefold() == title
+        ].index
 
     if len(matches) == 0:
-        raise HTTPException(status_code=404, detail=f"'{query.title}' not found in {query.media_type}s.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{query.title}' not found in {query.media_type}s.",
+        )
 
     source_idx = matches[0]
 
     # Cosine Similarity ගණනය කිරීම
-    scores = cosine_similarity(matrix[source_idx], matrix).ravel()
-    scores[source_idx] = -1 # සෙවූ එකම නැවත පැමිණීම වැළැක්වීම
+    scores = cosine_similarity(
+        matrix[source_idx],
+        matrix,
+    ).ravel()
+
+    # සෙවූ එකම නැවත පැමිණීම වැළැක්වීම
+    scores[source_idx] = -1
 
     top_indices = scores.argsort()[::-1][:query.top_k]
 
-    # ප්‍රතිඵල JSON (Dictionary List) එකක් ලෙස සැකසීම
+    # ප්‍රතිඵල JSON ලෙස සැකසීම
     results = []
+
     for idx in top_indices:
         movie_data = data.iloc[idx]
+
         results.append({
             "id": int(movie_data["id"]),
             "title": str(movie_data["title"]),
             "genres": str(movie_data["genres"]),
             "overview": str(movie_data["overview"]),
-            "poster_path": str(movie_data["poster_path"]) if pd.notna(movie_data["poster_path"]) else None,
-            "similarity": float(scores[idx])
+            "poster_path": (
+                str(movie_data["poster_path"])
+                if pd.notna(movie_data["poster_path"])
+                else None
+            ),
+            "similarity": float(scores[idx]),
         })
 
     return {"results": results}
