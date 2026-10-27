@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import json
+import secrets
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -72,6 +73,24 @@ for index in range(max(len(SHELF_MOVIES), len(SHELF_TV))):
                 seen_shelf_titles.add(key)
                 SHELF_ALL.append(item)
 
+
+def surprise_items(data, media_type):
+    complete = data.dropna(subset=["id", "title", "genres", "overview", "poster_path"])
+    for field in ("title", "genres", "overview", "poster_path"):
+        complete = complete[complete[field].astype(str).str.strip().ne("")]
+    return [{"id": int(row.id), "title": str(row.title), "media_type": media_type} for row in complete.itertuples(index=False)]
+
+
+SURPRISE_CATALOGUE = {
+    "movie": surprise_items(movies_df, "movie"),
+    "tv": surprise_items(tv_df, "tv"),
+}
+SURPRISE_INDEX = {
+    (media_type, item["id"]): index
+    for media_type, items in SURPRISE_CATALOGUE.items()
+    for index, item in enumerate(items)
+}
+
 print("Loading Complete! Server is ready.")
 
 # 2. Frontend එකෙන් එන Request එකේ තිබිය යුතු දත්ත ආකෘතිය
@@ -92,6 +111,24 @@ async def get_shelf(media_type: Literal["all", "movie", "tv"] = "all", offset: i
     catalogue = {"all": SHELF_ALL, "movie": SHELF_MOVIES, "tv": SHELF_TV}[media_type]
     items = catalogue[offset:offset + 5]
     return {"items": items, "has_more": offset + len(items) < len(catalogue)}
+
+
+@app.get("/surprise")
+async def get_surprise(previous_id: int | None = None, previous_media_type: Literal["movie", "tv"] | None = None):
+    previous_index = SURPRISE_INDEX.get((previous_media_type, previous_id))
+    available_types = [
+        media_type for media_type, items in SURPRISE_CATALOGUE.items()
+        if len(items) > (1 if previous_media_type == media_type and previous_index is not None else 0)
+    ]
+    if not available_types:
+        raise HTTPException(status_code=404, detail="No titles are available for Surprise Me.")
+    media_type = secrets.choice(available_types)
+    items = SURPRISE_CATALOGUE[media_type]
+    skip_index = previous_index if media_type == previous_media_type else None
+    index = secrets.randbelow(len(items) - (skip_index is not None))
+    if skip_index is not None and index >= skip_index:
+        index += 1
+    return items[index]
 
 
 OMDB_URL = "https://www.omdbapi.com/"
